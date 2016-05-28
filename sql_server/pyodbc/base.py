@@ -209,6 +209,11 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         self.validation = BaseDatabaseValidation(self)
 
     def create_cursor(self):
+        # hacky solution to allow read/writing to table with geometry column without throwing error on type
+        def geometry_converter(arg):
+            return None
+
+        self.connection.add_output_converter(-151, geometry_converter)
         return CursorWrapper(self.connection.cursor(), self)
 
     def get_connection_params(self):
