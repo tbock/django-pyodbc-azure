@@ -17,19 +17,21 @@ Microsoft SQL Server and Azure SQL Database.
 Features
 --------
 
--  Supports Django 1.9.3
+-  Supports Django 1.10.4
 -  Supports Microsoft SQL Server 2005, 2008/2008R2, 2012, 2014, 2016 and
    Azure SQL Database
 -  Supports LIMIT+OFFSET and offset w/o LIMIT emulation.
 -  Passes most of the tests of the Django test suite.
--  Compatible with *SQL Server* , *SQL Server Native Client* ,
-   *Micosoft ODBC Driver 11 for SQL Server on Windows* and
-   *FreeTDS* ODBC drivers.
+-  Compatible with
+   `Micosoft ODBC Driver for SQL Server <https://msdn.microsoft.com/library/mt654048(v=sql.1).aspx>`__,
+   `SQL Server Native Client <https://msdn.microsoft.com/library/ms130892(v=sql.120).aspx>`__,
+   `SQL Server <https://msdn.microsoft.com/library/aa968814(vs.85).aspx>`__
+   and `FreeTDS <http://www.freetds.org/>`__ ODBC drivers.
 
 Dependencies
 ------------
 
--  Django 1.9.3
+-  Django 1.10.4
 -  pyodbc 3.0 or newer
 
 Installation
@@ -218,7 +220,7 @@ Here is an example of the database settings:
             'PORT': '',
 
             'OPTIONS': {
-                'driver': 'ODBC Driver 11 for SQL Server',
+                'driver': 'ODBC Driver 13 for SQL Server',
             },
         },
     }
@@ -236,12 +238,12 @@ The following features are currently not supported:
 Notice
 ------
 
-This version of *django-pyodbc-azure* only supports Django 1.9.
+This version of *django-pyodbc-azure* only supports Django 1.10.
 If you want to use it on older versions of Django,
-specify an appropriate version number (1.8.x.x for Django 1.8)
+specify an appropriate version number (1.9.x.x for Django 1.9)
 at installation like this: ::
 
-    pip install "django-pyodbc-azure<1.9"
+    pip install "django-pyodbc-azure<1.10"
 
 License
 -------

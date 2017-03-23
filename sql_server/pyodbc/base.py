@@ -1,14 +1,13 @@
 """
 MS SQL Server database backend for Django.
 """
-import datetime
 import os
 import re
 import time
 
 from django.core.exceptions import ImproperlyConfigured
 from django import VERSION
-if VERSION[:3] < (1,9,3) or VERSION[:2] >= (1,10):
+if VERSION[:3] < (1,10,4) or VERSION[:2] >= (1,11):
     raise ImproperlyConfigured("Django %d.%d.%d is not supported." % VERSION[:3])
 
 try:
@@ -71,6 +70,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
     # If a column type is set to None, it won't be included in the output.
     data_types = {
         'AutoField':         'int IDENTITY (1, 1)',
+        'BigAutoField':      'bigint IDENTITY (1, 1)',
         'BigIntegerField':   'bigint',
         'BinaryField':       'varbinary(max)',
         'BooleanField':      'bit',
@@ -125,7 +125,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
     #
     # Note: we use str.format() here for readability as '%' is used as a wildcard for
     # the LIKE operator.
-    pattern_esc = r"REPLACE(REPLACE(REPLACE({}, '\', '\\'), '%%', '\%%'), '_', '\_')"
+    pattern_esc = r"REPLACE(REPLACE(REPLACE({}, '\', '[\]'), '%%', '[%%]'), '_', '[_]')"
     pattern_ops = {
         'contains': "LIKE '%%' + {} + '%%'",
         'icontains': "LIKE '%%' + UPPER({}) + '%%'",
@@ -148,6 +148,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         11: 2012,
         12: 2014,
         13: 2016,
+        14: 2017,
     }
 
     # https://azure.microsoft.com/en-us/documentation/articles/sql-database-develop-csharp-retry-windows/

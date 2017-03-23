@@ -1,8 +1,60 @@
+from itertools import chain
+
+from django.db.models.aggregates import Avg, Count, StdDev, Variance
 from django.db.models.expressions import Ref, Value
+from django.db.models.functions import ConcatPair, Greatest, Least, Length, Substr
 from django.db.models.sql import compiler
 from django.db.transaction import TransactionManagementError
 from django.db.utils import DatabaseError
 from django.utils import six
+
+
+def _as_sql_agv(self, compiler, connection):
+    return self.as_sql(compiler, connection, template='%(function)s(CONVERT(float, %(field)s))')
+
+def _as_sql_concatpair(self, compiler, connection):
+    if connection.sql_server_version < 2012:
+        node = self.coalesce()
+        return node.as_sql(compiler, connection, arg_joiner=' + ', template='%(expressions)s')
+    else:
+        return self.as_sql(compiler, connection)
+
+def _as_sql_count(self, compiler, connection):
+    return self.as_sql(compiler, connection, function='COUNT_BIG')
+
+def _as_sql_greatest(self, compiler, connection):
+    # SQL Server does not provide GREATEST function,
+    # so we emulate it with a table value constructor
+    # https://msdn.microsoft.com/en-us/library/dd776382.aspx
+    template='(SELECT MAX(value) FROM (VALUES (%(expressions)s)) AS _%(function)s(value))'
+    return self.as_sql(compiler, connection, arg_joiner='), (', template=template)
+
+def _as_sql_least(self, compiler, connection):
+    # SQL Server does not provide LEAST function,
+    # so we emulate it with a table value constructor
+    # https://msdn.microsoft.com/en-us/library/dd776382.aspx
+    template='(SELECT MIN(value) FROM (VALUES (%(expressions)s)) AS _%(function)s(value))'
+    return self.as_sql(compiler, connection, arg_joiner='), (', template=template)
+
+def _as_sql_length(self, compiler, connection):
+    return self.as_sql(compiler, connection, function='LEN')
+
+def _as_sql_stddev(self, compiler, connection):
+    function = 'STDEV'
+    if self.function == 'STDDEV_POP':
+        function = '%sP' % function
+    return self.as_sql(compiler, connection, function=function)
+
+def _as_sql_substr(self, compiler, connection):
+    if len(self.get_source_expressions()) < 3:
+        self.get_source_expressions().append(Value(2**31-1))
+    return self.as_sql(compiler, connection)
+
+def _as_sql_variance(self, compiler, connection):
+    function = 'VAR'
+    if self.function == 'VAR_POP':
+        function = '%sP' % function
+    return self.as_sql(compiler, connection, function=function)
 
 
 class SQLCompiler(compiler.SQLCompiler):
@@ -87,10 +139,6 @@ class SQLCompiler(compiler.SQLCompiler):
 
             result.append(', '.join(out_cols))
 
-            result.append('FROM')
-            result.extend(from_)
-            params.extend(f_params)
-
             if self.query.select_for_update and self.connection.features.has_select_for_update:
                 if self.connection.get_autocommit():
                     raise TransactionManagementError(
@@ -103,7 +151,11 @@ class SQLCompiler(compiler.SQLCompiler):
                 nowait = self.query.select_for_update_nowait
                 if nowait and not self.connection.features.has_select_for_update_nowait:
                     raise DatabaseError('NOWAIT is not supported on this database backend.')
-                result.append(self.connection.ops.for_update_sql(nowait=nowait))
+                from_.insert(1, self.connection.ops.for_update_sql(nowait=nowait))
+
+            result.append('FROM')
+            result.extend(from_)
+            params.extend(f_params)
 
             if where:
                 result.append('WHERE %s' % where)
@@ -161,36 +213,28 @@ class SQLCompiler(compiler.SQLCompiler):
         return super(SQLCompiler, self).compile(node, select_format)
 
     def _as_microsoft(self, node):
-        if hasattr(node, 'function'):
-            if node.function == 'AVG':
-                node.template = '%(function)s(CONVERT(float, %(field)s))'
-            elif node.function == 'CONCAT':
-                if self.connection.sql_server_version < 2012:
-                    node.arg_joiner = ' + '
-                    node.template = '%(expressions)s'
-                    node = node.coalesce()
-            # SQL Server does not provide GREATEST/LEAST functions,
-            # so we emulate them with table value constructors
-            # https://msdn.microsoft.com/en-us/library/dd776382.aspx
-            elif node.function == 'GREATEST':
-                node.arg_joiner = '), ('
-                node.template = '(SELECT MAX(value) FROM (VALUES (%(expressions)s)) AS _%(function)s(value))'
-            elif node.function == 'LEAST':
-                node.arg_joiner = '), ('
-                node.template = '(SELECT MIN(value) FROM (VALUES (%(expressions)s)) AS _%(function)s(value))'
-            elif node.function == 'LENGTH':
-                node.function = 'LEN'
-            elif node.function == 'STDDEV_SAMP':
-                node.function = 'STDEV'
-            elif node.function == 'STDDEV_POP':
-                node.function = 'STDEVP'
-            elif node.function == 'SUBSTRING':
-                if len(node.get_source_expressions()) < 3:
-                    node.get_source_expressions().append(Value(2**31-1))
-            elif node.function == 'VAR_SAMP':
-                node.function = 'VAR'
-            elif node.function == 'VAR_POP':
-                node.function = 'VARP'
+        as_microsoft = None
+        if isinstance(node, Avg):
+            as_microsoft = _as_sql_agv
+        elif isinstance(node, ConcatPair):
+            as_microsoft = _as_sql_concatpair
+        elif isinstance(node, Count):
+            as_microsoft = _as_sql_count
+        elif isinstance(node, Greatest):
+            as_microsoft = _as_sql_greatest
+        elif isinstance(node, Least):
+            as_microsoft = _as_sql_least
+        elif isinstance(node, Length):
+            as_microsoft = _as_sql_length
+        elif isinstance(node, StdDev):
+            as_microsoft = _as_sql_stddev
+        elif isinstance(node, Substr):
+            as_microsoft = _as_sql_substr
+        elif isinstance(node, Variance):
+            as_microsoft = _as_sql_variance
+        if as_microsoft:
+            node = node.copy()
+            node.as_microsoft = six.create_bound_method(as_microsoft, node)
         return node
 
 
@@ -230,8 +274,9 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
         if self.return_id and self.connection.features.can_return_id_from_insert:
             result.insert(0, 'SET NOCOUNT ON')
             result.append((values_format + ';') % ', '.join(placeholder_rows[0]))
-            result.append('SELECT CAST(SCOPE_IDENTITY() AS int)')
-            return [(" ".join(result), tuple(param_rows[0]))]
+            params = [param_rows[0]]
+            result.append('SELECT CAST(SCOPE_IDENTITY() AS bigint)')
+            return [(" ".join(result), tuple(chain.from_iterable(params)))]
 
         if can_bulk:
             result.append(self.connection.ops.bulk_insert_sql(fields, placeholder_rows))
@@ -259,7 +304,11 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
 
 
 class SQLDeleteCompiler(compiler.SQLDeleteCompiler, SQLCompiler):
-    pass
+    def as_sql(self):
+        sql, params = super(SQLDeleteCompiler, self).as_sql()
+        if sql:
+            sql = '; '.join(['SET NOCOUNT OFF', sql])
+        return sql, params
 
 
 class SQLUpdateCompiler(compiler.SQLUpdateCompiler, SQLCompiler):

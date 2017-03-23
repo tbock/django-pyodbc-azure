@@ -4,7 +4,7 @@ import datetime
 from django.db.backends.base.schema import (
     BaseDatabaseSchemaEditor, logger, _related_non_m2m_objects,
 )
-from django.db.models.fields import AutoField
+from django.db.models.fields import AutoField, BigAutoField
 from django.db.models.fields.related import ManyToManyField
 from django.utils import six
 from django.utils.text import force_text
@@ -43,9 +43,6 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     sql_alter_column_null = "ALTER COLUMN %(column)s %(type)s NULL"
     sql_alter_column_type = "ALTER COLUMN %(column)s %(type)s"
     sql_create_column = "ALTER TABLE %(table)s ADD %(column)s %(definition)s"
-    sql_create_fk = "ALTER TABLE %(table)s ADD CONSTRAINT %(name)s " \
-                    "FOREIGN KEY (%(column)s) " \
-                    "REFERENCES %(to_table)s (%(to_column)s)"
     sql_delete_column = "ALTER TABLE %(table)s DROP COLUMN %(column)s"
     sql_delete_index = "DROP INDEX %(name)s ON %(table)s"
     sql_delete_table = "DROP TABLE %(table)s"
@@ -60,10 +57,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                      old_db_params, new_db_params, strict=False):
         """Actually perform a "physical" (non-ManyToMany) field update."""
 
-        # the backend doesn't support altering from/to AutoField
+        # the backend doesn't support altering from/to (Big)AutoField
         # because of the limited capability of SQL Server to edit IDENTITY property
-        if isinstance(old_field, AutoField) or isinstance(new_field, AutoField):
-            raise NotImplementedError("the backend doesn't support altering from/to AutoField.")
+        for t in (AutoField, BigAutoField):
+            if isinstance(old_field, t) or isinstance(new_field, t):
+                raise NotImplementedError("the backend doesn't support altering from/to %s." % t.__name__)
         # Drop any FK constraints, we'll remake them later
         fks_dropped = set()
         if old_field.remote_field and old_field.db_constraint:
@@ -134,21 +132,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             actions.append(fragment)
             post_actions.extend(other_actions)
             # Drop unique constraint, SQL Server requires explicit deletion
-            if old_field.unique and new_field.unique:
-                constraint_names = self._constraint_names(model, [old_field.column], unique=True)
-                if strict and len(constraint_names) != 1:
-                    raise ValueError("Found wrong number (%s) of unique constraints for %s.%s" % (
-                        len(constraint_names),
-                        model._meta.db_table,
-                        old_field.column,
-                    ))
-                for constraint_name in constraint_names:
-                    self.execute(self._delete_constraint_sql(self.sql_delete_unique, model, constraint_name))
+            self._delete_unique_constraints(model, old_field, new_field, strict)
             # Drop indexes, SQL Server requires explicit deletion
-            elif old_field.db_index and new_field.db_index:
-                index_names = self._constraint_names(model, [old_field.column], index=True)
-                for index_name in index_names:
-                    self.execute(self._delete_constraint_sql(self.sql_delete_index, model, index_name))
+            self._delete_indexes(model, old_field, new_field)
         # When changing a column NULL constraint to NOT NULL with a given
         # default value, we need to perform 4 steps:
         #  1. Add a default for new incoming writes
@@ -171,6 +157,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 actions.append((
                     self.sql_alter_column_default % {
                         "column": self.quote_name(new_field.column),
+                        "type": new_type,
                         "default": self.prepare_default(new_default),
                     },
                     [],
@@ -179,6 +166,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 actions.append((
                     self.sql_alter_column_default % {
                         "column": self.quote_name(new_field.column),
+                        "type": new_type,
                         "default": "%s",
                     },
                     [new_default],
@@ -206,21 +194,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                     [],
                 ))
                 # Drop unique constraint, SQL Server requires explicit deletion
-                if old_field.unique and new_field.unique:
-                    constraint_names = self._constraint_names(model, [old_field.column], unique=True)
-                    if strict and len(constraint_names) != 1:
-                        raise ValueError("Found wrong number (%s) of unique constraints for %s.%s" % (
-                            len(constraint_names),
-                            model._meta.db_table,
-                            old_field.column,
-                        ))
-                    for constraint_name in constraint_names:
-                        self.execute(self._delete_constraint_sql(self.sql_delete_unique, model, constraint_name))
+                self._delete_unique_constraints(model, old_field, new_field, strict)
                 # Drop indexes, SQL Server requires explicit deletion
-                elif old_field.db_index and new_field.db_index:
-                    index_names = self._constraint_names(model, [old_field.column], index=True)
-                    for index_name in index_names:
-                        self.execute(self._delete_constraint_sql(self.sql_delete_index, model, index_name))
+                self._delete_indexes(model, old_field, new_field)
         # Only if we have a default and there is a change from NULL to NOT NULL
         four_way_default_alteration = (
             new_field.has_default() and
@@ -277,10 +253,28 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             self.execute(self._create_index_sql(model, [new_field], suffix="_uniq"))
         # Restore an index, SQL Server requires explicit restoration
         if old_type != new_type or (old_field.null and not new_field.null):
+            unique_columns = []
             if old_field.unique and new_field.unique:
-                self.execute(self._create_unique_sql(model, [new_field.column]))
-            elif old_field.db_index and new_field.db_index:
-                self.execute(self._create_index_sql(model, [new_field]))
+                unique_columns.append([old_field.column])
+            else:
+                for fields in model._meta.unique_together:
+                    columns = [model._meta.get_field(field).column for field in fields]
+                    if old_field.column in columns:
+                        unique_columns.append(columns)
+            if unique_columns:
+                for columns in unique_columns:
+                    self.execute(self._create_unique_sql(model, columns))
+            index_columns = []
+            if old_field.db_index and new_field.db_index:
+                index_columns.append([old_field])
+            else:
+                for fields in model._meta.index_together:
+                    columns = [model._meta.get_field(field) for field in fields]
+                    if old_field.column in [c.column for c in columns]:
+                        index_columns.append(columns)
+            if index_columns:
+                for columns in index_columns:
+                    self.execute(self._create_index_sql(model, columns, suffix='_idx'))
         # Type alteration on primary key? Then we need to alter the column
         # referring to us.
         rels_to_update = []
@@ -362,12 +356,49 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                         "table": self.quote_name(model._meta.db_table),
                         "changes": self.sql_alter_column_no_default % {
                             "name": self.quote_name(next(iter(row))),
+                            "type": new_type,
                         }
                     }
                     self.execute(sql)
         # Reset connection if required
         if self.connection.features.connection_persists_old_columns:
             self.connection.close()
+
+    def _delete_indexes(self, model, old_field, new_field):
+        index_columns = []
+        if old_field.db_index and new_field.db_index:
+            index_columns.append([old_field.column])
+        else:
+            for fields in model._meta.index_together:
+                columns = [model._meta.get_field(field).column for field in fields]
+                if old_field.column in columns:
+                    index_columns.append(columns)
+        if index_columns:
+            for columns in index_columns:
+                index_names = self._constraint_names(model, columns, index=True)
+                for index_name in index_names:
+                    self.execute(self._delete_constraint_sql(self.sql_delete_index, model, index_name))
+
+    def _delete_unique_constraints(self, model, old_field, new_field, strict=False):
+        unique_columns = []
+        if old_field.unique and new_field.unique:
+            unique_columns.append([old_field.column])
+        else:
+            for fields in model._meta.unique_together:
+                columns = [model._meta.get_field(field).column for field in fields]
+                if old_field.column in columns:
+                    unique_columns.append(columns)
+        if unique_columns:
+            for columns in unique_columns:
+                constraint_names = self._constraint_names(model, columns, unique=True)
+                if strict and len(constraint_names) != 1:
+                    raise ValueError("Found wrong number (%s) of unique constraints for %s.%s" % (
+                        len(constraint_names),
+                        model._meta.db_table,
+                        old_field.column,
+                    ))
+                for constraint_name in constraint_names:
+                    self.execute(self._delete_constraint_sql(self.sql_delete_unique, model, constraint_name))
 
     def _rename_field_sql(self, table, old_field, new_field, new_type):
         new_type = self._set_field_new_type_null_status(old_field, new_type)
@@ -430,7 +461,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                     }
                     self.execute(sql)
         # Add an index, if required
-        if field.db_index and not field.unique:
+        if self._field_should_be_indexed(model, field):
             self.deferred_sql.append(self._create_index_sql(model, [field]))
         # Add any FK constraints later
         if field.remote_field and self.connection.features.supports_foreign_keys and field.db_constraint:
@@ -482,7 +513,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 definition,
             ))
             # Autoincrement SQL (for backends with post table definition variant)
-            if field.get_internal_type() == "AutoField":
+            if field.get_internal_type() in ("AutoField", "BigAutoField"):
                 autoinc_sql = self.connection.ops.autoinc_sql(model._meta.db_table, field.column)
                 if autoinc_sql:
                     self.deferred_sql.extend(autoinc_sql)
@@ -542,7 +573,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         """
         result = None
         # Log the command we're running, then run it
-        logger.debug("%s; (params %r)" % (sql, params))
+        logger.debug("%s; (params %r)", sql, params, extra={'params': params, 'sql': sql})
         if self.collect_sql:
             ending = "" if sql.endswith(";") else ";"
             if params is not None:
@@ -600,47 +631,40 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # It might not actually have a column behind it
         if field.db_parameters(connection=self.connection)['type'] is None:
             return
-        # Drop any FK constraints, MySQL requires explicit deletion
-        if field.remote_field:
-            fk_names = self._constraint_names(model, [field.column], foreign_key=True)
-            for fk_name in fk_names:
-                self.execute(self._delete_constraint_sql(self.sql_delete_fk, model, fk_name))
+        # Drop any FK constraints, SQL Server requires explicit deletion
+        with self.connection.cursor() as cursor:
+            constraints = self.connection.introspection.get_constraints(cursor, model._meta.db_table)
+        for name, infodict in constraints.items():
+            if field.column in infodict['columns'] and infodict['foreign_key']:
+                self.execute(self._delete_constraint_sql(self.sql_delete_fk, model, name))
         # Drop any indexes, SQL Server requires explicit deletion
-        index_names = self._constraint_names(model, [field.column], index=True)
-        for index_name in index_names:
-            self.execute(
-                self.sql_delete_index % {
+        for name, infodict in constraints.items():
+            if field.column in infodict['columns'] and infodict['index']:
+                self.execute(self.sql_delete_index % {
                     "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(index_name),
-                }
-            )
+                    "name": self.quote_name(name),
+                })
         # Drop primary key constraint, SQL Server requires explicit deletion
-        pk_names = self._constraint_names(model, [field.column], primary_key=True)
-        for pk_name in pk_names:
-            self.execute(
-                self.sql_delete_pk % {
+        for name, infodict in constraints.items():
+            if field.column in infodict['columns'] and infodict['primary_key']:
+                self.execute(self.sql_delete_pk % {
                     "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(pk_name),
-                }
-            )
+                    "name": self.quote_name(name),
+                })
         # Drop check constraints, SQL Server requires explicit deletion
-        check_names = self._constraint_names(model, [field.column], check=True)
-        for check_name in check_names:
-            self.execute(
-                self.sql_delete_check % {
+        for name, infodict in constraints.items():
+            if field.column in infodict['columns'] and infodict['check']:
+                self.execute(self.sql_delete_check % {
                     "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(check_name),
-                }
-            )
+                    "name": self.quote_name(name),
+                })
         # Drop unique constraints, SQL Server requires explicit deletion
-        unique_names = self._constraint_names(model, [field.column], unique=True)
-        for unique_name in unique_names:
-            self.execute(
-                self.sql_delete_unique % {
+        for name, infodict in constraints.items():
+            if field.column in infodict['columns'] and infodict['unique'] and not infodict['primary_key']:
+                self.execute(self.sql_delete_unique % {
                     "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(unique_name),
-                }
-            )
+                    "name": self.quote_name(name),
+                })
         # Delete the column
         sql = self.sql_delete_column % {
             "table": self.quote_name(model._meta.db_table),
