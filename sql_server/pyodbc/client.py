@@ -1,6 +1,4 @@
-import os
 import re
-import subprocess
 
 from django.db.backends.base.client import BaseDatabaseClient
 
@@ -13,8 +11,7 @@ class DatabaseClient(BaseDatabaseClient):
         user = options.get('user', settings_dict['USER'])
         password = options.get('passwd', settings_dict['PASSWORD'])
 
-        default_driver = 'SQL Server' if os.name == 'nt' else 'FreeTDS'
-        driver = options.get('driver', default_driver)
+        driver = options.get('driver', '')
         ms_drivers = re.compile('.*SQL (Server$|(Server )?Native Client)')
         if not ms_drivers.match(driver):
             self.executable_name = 'isql'
@@ -27,8 +24,6 @@ class DatabaseClient(BaseDatabaseClient):
 
             args = [self.executable_name]
             if server:
-                if port:
-                    server = ','.join((server, port))
                 args += ["-S", server]
             if user:
                 args += ["-U", user]
@@ -44,7 +39,8 @@ class DatabaseClient(BaseDatabaseClient):
             dsn = options.get('dsn', '')
             args = ['%s -v %s %s %s' % (self.executable_name, dsn, user, password)]
 
+        import subprocess
         try:
-            subprocess.check_call(args)
+            subprocess.call(args, shell=True)
         except KeyboardInterrupt:
             pass

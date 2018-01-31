@@ -5,6 +5,7 @@ import warnings
 
 from django.conf import settings
 from django.db.backends.base.operations import BaseDatabaseOperations
+from django.db.models.expressions import Exists
 from django.db.models.functions import Greatest, Least
 from django.utils import timezone
 from django.utils.encoding import force_text
@@ -82,6 +83,13 @@ class DatabaseOperations(BaseDatabaseOperations):
                     raise NotImplementedError(
                         'SQL Server has no support for %s function.' %
                         f.function)
+        # SQL Server doesn't allow to use EXISTS in a selection list
+        unsupported_expressions = (Exists, )
+        for e in unsupported_expressions:
+            if isinstance(expression, e):
+                raise NotImplementedError(
+                    "the backend doesn't support %s expression." %
+                    e.__name__)
 
     def combine_duration_expression(self, connector, sub_expressions):
         lhs, rhs = sub_expressions
@@ -126,7 +134,7 @@ class DatabaseOperations(BaseDatabaseOperations):
                 self._warn_legacy_driver('datetime2')
                 value = datetime.datetime.strptime(value[:26], '%Y-%m-%d %H:%M:%S.%f')
             if settings.USE_TZ:
-                value = timezone.make_aware(value, self.connection.timezone)
+                value = timezone.make_aware(value, timezone.utc)
         return value
 
     def convert_floatfield_value(self, value, expression, connection, context):
@@ -226,7 +234,7 @@ class DatabaseOperations(BaseDatabaseOperations):
         Returns the FOR UPDATE SQL clause to lock rows for an update operation.
         """
         if skip_locked:
-            return 'WITH (ROWLOCK, UPDLOCK, READPAST)'
+            return 'WITH (NOLOCK)'
         elif nowait:
             return 'WITH (NOWAIT, ROWLOCK, UPDLOCK)'
         else:
@@ -472,7 +480,7 @@ class DatabaseOperations(BaseDatabaseOperations):
             return None
         if settings.USE_TZ and timezone.is_aware(value):
             # pyodbc donesn't support datetimeoffset
-            value = value.astimezone(self.connection.timezone).replace(tzinfo=None)
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
         if not self.connection.features.supports_microsecond_precision:
             value = value.replace(microsecond=0)
         return value
