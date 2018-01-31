@@ -7,7 +7,7 @@ import time
 
 from django.core.exceptions import ImproperlyConfigured
 from django import VERSION
-if VERSION[:3] < (1,11,0) or VERSION[:2] >= (1,12):
+if VERSION[:3] < (1,11,9) or VERSION[:2] >= (2,0):
     raise ImproperlyConfigured("Django %d.%d.%d is not supported." % VERSION[:3])
 
 try:
@@ -226,7 +226,6 @@ class DatabaseWrapper(BaseDatabaseWrapper):
     def get_connection_params(self):
         settings_dict = self.settings_dict
         if settings_dict['NAME'] == '':
-            from django.core.exceptions import ImproperlyConfigured
             raise ImproperlyConfigured(
                 "settings.DATABASES is improperly configured. "
                 "Please supply the NAME value.")
@@ -247,19 +246,20 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         driver = options.get('driver', default_driver)
         dsn = options.get('dsn', None)
 
-        # unixODBC uses string 'FreeTDS'; iODBC requires full path to lib
-        if driver == 'FreeTDS' or driver.endswith('/libtdsodbc.so'):
-            driver_is_freetds = True
-        else:
-            driver_is_freetds = False
-
         # Microsoft driver names assumed here are:
         # * SQL Server
         # * SQL Native Client
         # * SQL Server Native Client 10.0/11.0
-        # * ODBC Driver 11 for SQL Server
+        # * ODBC Driver 11/13 for SQL Server
         ms_drivers = re.compile('.*SQL (Server$|(Server )?Native Client)')
 
+        # available ODBC connection string keywords:
+        # (Microsoft drivers for Windows)
+        # https://docs.microsoft.com/en-us/sql/relational-databases/native-client/applications/using-connection-string-keywords-with-sql-server-native-client
+        # (Microsoft drivers for Linux/Mac)
+        # https://docs.microsoft.com/en-us/sql/connect/odbc/linux-mac/connection-string-keywords-and-data-source-names-dsns
+        # (FreeTDS)
+        # http://www.freetds.org/userguide/odbcconnattr.htm
         cstr_parts = {}
         if dsn:
             cstr_parts['DSN'] = dsn
@@ -267,8 +267,11 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             # Only append DRIVER if DATABASE_ODBC_DSN hasn't been set
             cstr_parts['DRIVER'] = driver
 
-            if ms_drivers.match(driver) or driver_is_freetds and \
-                options.get('host_is_server', False):
+            if ms_drivers.match(driver):
+                if port:
+                    host = ','.join((host,port))
+                cstr_parts['SERVER'] = host
+            elif options.get('host_is_server', False):
                 if port:
                     cstr_parts['PORT'] = str(port)
                 cstr_parts['SERVER'] = host
@@ -397,20 +400,40 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         return DatabaseSchemaEditor(self, *args, **kwargs)
 
     @cached_property
-    def sql_server_version(self):
-        with self.temporary_connection() as cursor:
-            cursor.execute("SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar)")
-            ver = cursor.fetchone()[0]
-            ver = int(ver.split('.')[0])
-            if not ver in self._sql_server_versions:
-                raise NotImplementedError('SQL Server v%d is not supported.' % ver)
-            return self._sql_server_versions[ver]
+    def sql_server_version(self, _known_versions={}):
+        """
+        Get the SQL server version
+
+        The _known_versions default dictionary is created on the class. This is
+        intentional - it allows us to cache this property's value across instances.
+        Therefore, when Django creates a new database connection using the same
+        alias, we won't need query the server again.
+        """
+        if self.alias not in _known_versions:
+            with self.temporary_connection() as cursor:
+                cursor.execute("SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar)")
+                ver = cursor.fetchone()[0]
+                ver = int(ver.split('.')[0])
+                if not ver in self._sql_server_versions:
+                    raise NotImplementedError('SQL Server v%d is not supported.' % ver)
+                _known_versions[self.alias] = self._sql_server_versions[ver]
+        return _known_versions[self.alias]
 
     @cached_property
-    def to_azure_sql_db(self):
-        with self.temporary_connection() as cursor:
-            cursor.execute("SELECT CAST(SERVERPROPERTY('EngineEdition') AS integer)")
-            return cursor.fetchone()[0] == EDITION_AZURE_SQL_DB
+    def to_azure_sql_db(self, _known_azures={}):
+        """
+        Whether this connection is to a Microsoft Azure database server
+
+        The _known_azures default dictionary is created on the class. This is
+        intentional - it allows us to cache this property's value across instances.
+        Therefore, when Django creates a new database connection using the same
+        alias, we won't need query the server again.
+        """
+        if self.alias not in _known_azures:
+            with self.temporary_connection() as cursor:
+                cursor.execute("SELECT CAST(SERVERPROPERTY('EngineEdition') AS integer)")
+                _known_azures[self.alias] = cursor.fetchone()[0] == EDITION_AZURE_SQL_DB
+        return _known_azures[self.alias]
 
     def _execute_foreach(self, sql, table_names=None):
         cursor = self.cursor()
