@@ -1,4 +1,3 @@
-import os
 import re
 import subprocess
 
@@ -13,9 +12,8 @@ class DatabaseClient(BaseDatabaseClient):
         user = options.get('user', settings_dict['USER'])
         password = options.get('passwd', settings_dict['PASSWORD'])
 
-        default_driver = 'SQL Server' if os.name == 'nt' else 'FreeTDS'
-        driver = options.get('driver', default_driver)
-        ms_drivers = re.compile('.*SQL (Server$|(Server )?Native Client)')
+        driver = options.get('driver', 'ODBC Driver 13 for SQL Server')
+        ms_drivers = re.compile('^ODBC Driver .* for SQL Server$|^SQL Server Native Client')
         if not ms_drivers.match(driver):
             self.executable_name = 'isql'
 
@@ -28,7 +26,7 @@ class DatabaseClient(BaseDatabaseClient):
             args = [self.executable_name]
             if server:
                 if port:
-                    server = ','.join((server, port))
+                    server = ','.join((server, str(port)))
                 args += ["-S", server]
             if user:
                 args += ["-U", user]
