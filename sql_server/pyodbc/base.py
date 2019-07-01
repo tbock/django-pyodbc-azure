@@ -7,7 +7,8 @@ import time
 
 from django.core.exceptions import ImproperlyConfigured
 from django import VERSION
-if VERSION[:3] < (1,11,9) or VERSION[:2] >= (2,0):
+
+if VERSION[:3] < (1,11,15) or VERSION[:2] >= (2,0):
     raise ImproperlyConfigured("Django %d.%d.%d is not supported." % VERSION[:3])
 
 try:
@@ -208,13 +209,6 @@ class DatabaseWrapper(BaseDatabaseWrapper):
                     ops[op] = '%s COLLATE %s' % (sql, collation)
             self.operators.update(ops)
 
-        self.features = DatabaseFeatures(self)
-        self.ops = DatabaseOperations(self)
-        self.client = DatabaseClient(self)
-        self.creation = DatabaseCreation(self)
-        self.introspection = DatabaseIntrospection(self)
-        self.validation = BaseDatabaseValidation(self)
-
     def create_cursor(self, name=None):
         # hacky solution to allow read/writing to table with geometry column without throwing error on type
         def geometry_converter(arg):
@@ -269,7 +263,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
             if ms_drivers.match(driver):
                 if port:
-                    host = ','.join((host,port))
+                    host = ','.join((host, str(port)))
                 cstr_parts['SERVER'] = host
             elif options.get('host_is_server', False):
                 if port:
@@ -306,6 +300,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         timeout = options.get('connection_timeout', 0)
         retries = options.get('connection_retries', 5)
         backoff_time = options.get('connection_retry_backoff_time', 5)
+        query_timeout = options.get('query_timeout', 0)
 
         conn = None
         retry_count = 0
@@ -328,6 +323,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
                 if not need_to_retry:
                     raise
 
+        conn.timeout = query_timeout
         return conn
 
     def init_connection_state(self):
@@ -366,11 +362,15 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         settings_dict = self.settings_dict
         cursor = self.create_cursor()
 
+        options = settings_dict.get('OPTIONS', {})
+        isolation_level = options.get('isolation_level', None)
+        if isolation_level:
+            cursor.execute('SET TRANSACTION ISOLATION LEVEL %s' % isolation_level)
+
         # Set date format for the connection. Also, make sure Sunday is
         # considered the first day of the week (to be consistent with the
         # Django convention for the 'week_day' Django lookup) if the user
         # hasn't told us otherwise
-        options = settings_dict.get('OPTIONS', {})
         datefirst = options.get('datefirst', 7)
         cursor.execute('SET DATEFORMAT ymd; SET DATEFIRST %s' % datefirst)
 
@@ -394,10 +394,6 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             return False
         else:
             return True
-
-    def schema_editor(self, *args, **kwargs):
-        "Returns a new instance of this backend's SchemaEditor"
-        return DatabaseSchemaEditor(self, *args, **kwargs)
 
     @cached_property
     def sql_server_version(self, _known_versions={}):
