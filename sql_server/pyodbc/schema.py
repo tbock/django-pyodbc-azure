@@ -1,5 +1,7 @@
 import binascii
 import datetime
+import arcpy
+import os
 
 from django.db.backends.base.schema import (
     BaseDatabaseSchemaEditor, logger, _is_relevant_relation, _related_non_m2m_objects,
@@ -459,17 +461,22 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     #         new_type += " NOT NULL"
     #     return new_type
 
-    def _create_connection(self, model):
+    def _get_sde_connection(self):
         """
         Create a sde connection to use if it doesn't already exist
         """
+
         instance = self.connection.get('HOST')
         username = self.connection.get('USER', '')
         password = self.connection.get('PASSWORD', '')
         database = self.connection.get('NAME')
-        account_authentication = "OPERATING_SYSTEM_AUTH" if not username else "DATABASE_AUTH"
-        arcpy.CreateDatabaseConnection(out_folder_path, out_name, "SQL_SERVER", instance, account_authentication,
+
+        sde_file_path = f"../sde_connections/{databae}.sde"
+        if not os.path.exists(sde_file_path):
+            account_authentication = "OPERATING_SYSTEM_AUTH" if not username else "DATABASE_AUTH"
+            arcpy.CreateDatabaseConnection("../sde_connections", f"{database}.sde", "SQL_SERVER", instance, account_authentication,
                                        username, password, "SAVE_USERNAME", database)
+        return sde_file_path
 
     def add_field(self, model, field):
         """
@@ -477,6 +484,8 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         Usually involves adding a column, but may involve adding a
         table instead (for M2M fields)
         """
+        sde_path = self._get_sde_connection()
+
         # Special-case implicit M2M tables
         if field.many_to_many and field.remote_field.through._meta.auto_created:
             return self.create_model(field.remote_field.through)
@@ -531,6 +540,14 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         Takes a model and creates a table for it in the database.
         Will also create any accompanying indexes or unique constraints.
         """
+        sde_path = self._get_sde_connection()
+        if self.model._meta.is_spatial:
+            spatial_reference = arcpy.SpatialReference(arcpy.model._meta.spatial_reference_wkid) if arcpy.model._meta.spatial_reference else arcpy.SpatialReference(3857)
+            arcpy.CreateFeatureclass_management(sde_path, self.model._meta.db_table, self.model._meta.geometry_type,
+                                                spatial_reference=spatial_reference)
+        else:
+            arcpy.CreateTable_management(sde_path, self.model._meta.db_table)
+
         # Create column SQL, add FK deferreds if needed
         column_sqls = []
         params = []
