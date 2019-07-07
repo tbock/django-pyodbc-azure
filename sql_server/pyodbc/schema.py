@@ -1,6 +1,7 @@
 import binascii
 import datetime
 import arcpy
+import os
 
 from django.db.backends.base.schema import (
     BaseDatabaseSchemaEditor, logger, _is_relevant_relation, _related_non_m2m_objects,
@@ -485,17 +486,54 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     #         new_type += " NOT NULL"
     #     return new_type
 
-    def _create_connection(self, model):
+    def _create_connection(self, model, out_folder_path, out_name):
         """
         Create a sde connection to use if it doesn't already exist
         """
+        sde_file = "{}\\{}".format(out_folder_path, out_name)
+        if os.path.isfile(sde_file):
+            return sde_file
+
         instance = self.connection.get('HOST')
         username = self.connection.get('USER', '')
         password = self.connection.get('PASSWORD', '')
         database = self.connection.get('NAME')
         account_authentication = "OPERATING_SYSTEM_AUTH" if username and password else "DATABASE_AUTH"
-        arcpy.CreateDatabaseConnection(out_folder_path, out_name, "SQL_SERVER", instance, account_authentication,
-                                       username, password, "SAVE_USERNAME", database)
+        arcpy.CreateDatabaseConnection_management(out_folder_path, out_name, "SQL_SERVER", instance,
+                                                  account_authentication,
+                                                  username, password, "SAVE_USERNAME", database)
+
+    arcgis_data_types = {
+        # 'AutoField':         'int IDENTITY (1, 1)',
+        # 'BigAutoField':      'bigint IDENTITY (1, 1)',
+        'bigint': 'LONG',
+        'varbinary(max)': 'BLOB',
+        'bit': 'SHORT',
+        'nvarchar': 'TEXT',
+        'date': 'DATE',
+        'datetime2': 'DATE',
+        'numeric': 'DOUBLE',
+        'double precision': 'DOUBLE',
+        'int': 'SHORT',
+        'smallint': 'SHORT',
+        'time': 'DATE',
+        'char(32)': 'GUID',  # This may not be a good idea
+    }
+
+    def _convert_field_type_to_arcgis(self, definition_string, field):
+        extra_params = {'field_is_required': field.required}
+        for sql_type, arcgis_type in self.arcgis_data_types.items():
+            if sql_type in definition_string:
+                if arcgis_type == 'TEXT':
+                    extra_params['field_length'] = field.max_length if field.max_length else 8000
+                elif arcgis_type == 'DOUBLE':
+                    extra_params['field_scale'] = field.max_digits
+                    extra_params['field_prevision'] = field.decimal_places
+
+                if 'NOT NULL' in definition_string:
+                    extra_params['field_is_nullable'] = False
+
+                return arcgis_type
 
     def add_field(self, model, field):
         """
@@ -512,32 +550,25 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             return
         # Check constraints can go on the column SQL here
         db_params = field.db_parameters(connection=self.connection)
-        if db_params['check']:
-            definition += " CHECK (%s)" % db_params['check']
+        arcgis_field_type, extra_params = self._convert_field_type_to_arcgis(definition, field)
+
+        # if db_params['check']:
+        #     definition += " CHECK (%s)" % db_params['check']
         # Build the SQL and run it
-        sql = self.sql_create_column % {
-            "table": self.quote_name(model._meta.db_table),
-            "column": self.quote_name(field.column),
-            "definition": definition,
-        }
-        self.execute(sql, params)
+        # sql = self.sql_create_column % {
+        #     "table": self.quote_name(model._meta.db_table),
+        #     "column": self.quote_name(field.column),
+        #     "definition": definition,
+        # }
+        # self.execute(sql, params)
+        # just use arcpy instead
+        arcpy.AddField_management(self.quote_name(model._meta.db_table), self.quote_name(field.column),
+                                  arcgis_field_type,
+                                  field_alias=field.verbose_name, **extra_params)
+        # if db_params['check']:
+        #     arcpy.AddIndex(self.quote_name(model._meta.db_table), self.quote_name(field.column), {index_name}, {unique}, {ascending})
         # Drop the default if we need to
         # (Django usually does not use in-database defaults)
-        if not self.skip_default(field) and self.effective_default(field) is not None:
-            changes_sql, params = self._alter_column_default_sql(model, None, field, drop=True)
-            sql = self.sql_alter_column % {
-                "table": self.quote_name(model._meta.db_table),
-                "changes": changes_sql,
-            }
-            self.execute(sql, params)
-        # Add an index, if required
-        self.deferred_sql.extend(self._field_indexes_sql(model, field))
-        # Add any FK constraints later
-        if field.remote_field and self.connection.features.supports_foreign_keys and field.db_constraint:
-            self.deferred_sql.append(self._create_fk_sql(model, field, "_fk_%(to_table)s_%(to_column)s"))
-        # Reset connection if required
-        if self.connection.features.connection_persists_old_columns:
-            self.connection.close()
 
     def create_model(self, model):
         """
@@ -545,67 +576,21 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         Will also create any accompanying indexes or unique constraints.
         """
         # Create column SQL, add FK deferreds if needed
-        column_sqls = []
-        params = []
-        for field in model._meta.local_fields:
-            # SQL
-            definition, extra_params = self.column_sql(model, field)
-            if definition is None:
-                continue
-            # Check constraints can go on the column SQL here
-            db_params = field.db_parameters(connection=self.connection)
-            if db_params['check']:
-                # SQL Server requires a name for the check constraint
-                definition += self._sql_check_constraint % {
-                    "name": self._create_index_name(model._meta.db_table, [field.column], suffix="_check"),
-                    "check": db_params['check']
-                }
-            # Autoincrement SQL (for backends with inline variant)
-            col_type_suffix = field.db_type_suffix(connection=self.connection)
-            if col_type_suffix:
-                definition += " %s" % col_type_suffix
-            params.extend(extra_params)
-            # FK
-            if field.remote_field and field.db_constraint:
-                to_table = field.remote_field.model._meta.db_table
-                to_column = field.remote_field.model._meta.get_field(field.remote_field.field_name).column
-                if self.sql_create_inline_fk:
-                    definition += " " + self.sql_create_inline_fk % {
-                        "to_table": self.quote_name(to_table),
-                        "to_column": self.quote_name(to_column),
-                    }
-                elif self.connection.features.supports_foreign_keys:
-                    self.deferred_sql.append(self._create_fk_sql(model, field, "_fk_%(to_table)s_%(to_column)s"))
-            # Add the SQL to our big list
-            column_sqls.append("%s %s" % (
-                self.quote_name(field.column),
-                definition,
-            ))
-            # Autoincrement SQL (for backends with post table definition variant)
-            if field.get_internal_type() in ("AutoField", "BigAutoField"):
-                autoinc_sql = self.connection.ops.autoinc_sql(model._meta.db_table, field.column)
-                if autoinc_sql:
-                    self.deferred_sql.extend(autoinc_sql)
+        # column_sqls = []
+        # params = []
+        folder = os.getcwd()
+        sde_file = self._create_connection(model, folder, self.connection.get('NAME'))
 
         # Add any unique_togethers (always deferred, as some fields might be
         # created afterwards, like geometry fields with some backends)
-        for fields in model._meta.unique_together:
-            columns = [model._meta.get_field(field).column for field in fields]
-            self.deferred_sql.append(self._create_unique_sql(model, columns))
-        # Make the table
-        sql = self.sql_create_table % {
-            "table": self.quote_name(model._meta.db_table),
-            "definition": ", ".join(column_sqls)
-        }
-        if model._meta.db_tablespace:
-            tablespace_sql = self.connection.ops.tablespace_sql(model._meta.db_tablespace)
-            if tablespace_sql:
-                sql += ' ' + tablespace_sql
-        # Prevent using [] as params, in the case a literal '%' is used in the definition
-        self.execute(sql, params or None)
 
+        arcpy.CreateTable_management(sde_file, self.quote_name(model._meta.db_table))
+
+        for field in model._meta.local_fields:
+            # SQL
+            self.add_field(model, field)
         # Add any field index and index_together's (deferred as SQLite3 _remake_table needs it)
-        self.deferred_sql.extend(self._model_indexes_sql(model))
+        # self.deferred_sql.extend(self._model_indexes_sql(model))
 
         # Make M2M tables
         for field in model._meta.local_many_to_many:
@@ -617,62 +602,10 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         Deletes a model from the database.
         """
         # Delete the foreign key constraints
-        result = self.execute(
-            self._sql_select_foreign_key_constraints % {
-                "table": self.quote_value(model._meta.db_table),
-            },
-            has_result = True
-        )
-        if result:
-            for table, constraint in result:
-                sql = self.sql_alter_column % {
-                    "table": self.quote_name(table),
-                    "changes": self.sql_alter_column_no_default % {
-                        "column": self.quote_name(constraint),
-                    }
-                }
-                self.execute(sql)
-
-        # Delete the table
-        super().delete_model(model)
-        # Remove all deferred statements referencing the deleted table.
-        for sql in list(self.deferred_sql):
-            if isinstance(sql, Statement) and sql.references_table(model._meta.db_table):
-                self.deferred_sql.remove(sql)
+        arcpy.Delete_management(self.quote_name(model._meta.db_table))
 
     def execute(self, sql, params=(), has_result=False):
-        """
-        Executes the given SQL statement, with optional parameters.
-        """
-        result = None
-        # Don't perform the transactional DDL check if SQL is being collected
-        # as it's not going to be executed anyway.
-        if not self.collect_sql and self.connection.in_atomic_block and not self.connection.features.can_rollback_ddl:
-            raise TransactionManagementError(
-                "Executing DDL statements while in a transaction on databases "
-                "that can't perform a rollback is prohibited."
-            )
-        # Account for non-string statement objects.
-        sql = str(sql)
-        # Log the command we're running, then run it
-        logger.debug("%s; (params %r)", sql, params, extra={'params': params, 'sql': sql})
-        if self.collect_sql:
-            ending = "" if sql.endswith(";") else ";"
-            if params is not None:
-                self.collected_sql.append((sql % tuple(map(self.quote_value, params))) + ending)
-            else:
-                self.collected_sql.append(sql + ending)
-        else:
-            cursor = self.connection.cursor()
-            cursor.execute(sql, params)
-            if has_result:
-                result = cursor.fetchall()
-            # the cursor can be closed only when the driver supports opening
-            # multiple cursors on a connection because the migration command
-            # has already opened a cursor outside this method
-            if self.connection.supports_mars:
-                cursor.close()
-        return result
+        pass
 
     def prepare_default(self, value):
         return self.quote_value(value)
@@ -701,56 +634,5 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         Removes a field from a model. Usually involves deleting a column,
         but for M2Ms may involve deleting a table.
         """
+        arcpy.DeleteField_management(self.quote_name(model._meta.db_table), self.quote_name(field.column))
         # Special-case implicit M2M tables
-        if field.many_to_many and field.remote_field.through._meta.auto_created:
-            return self.delete_model(field.remote_field.through)
-        # It might not actually have a column behind it
-        if field.db_parameters(connection=self.connection)['type'] is None:
-            return
-        # Drop any FK constraints, SQL Server requires explicit deletion
-        with self.connection.cursor() as cursor:
-            constraints = self.connection.introspection.get_constraints(cursor, model._meta.db_table)
-        for name, infodict in constraints.items():
-            if field.column in infodict['columns'] and infodict['foreign_key']:
-                self.execute(self._delete_constraint_sql(self.sql_delete_fk, model, name))
-        # Drop any indexes, SQL Server requires explicit deletion
-        for name, infodict in constraints.items():
-            if field.column in infodict['columns'] and infodict['index']:
-                self.execute(self.sql_delete_index % {
-                    "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(name),
-                })
-        # Drop primary key constraint, SQL Server requires explicit deletion
-        for name, infodict in constraints.items():
-            if field.column in infodict['columns'] and infodict['primary_key']:
-                self.execute(self.sql_delete_pk % {
-                    "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(name),
-                })
-        # Drop check constraints, SQL Server requires explicit deletion
-        for name, infodict in constraints.items():
-            if field.column in infodict['columns'] and infodict['check']:
-                self.execute(self.sql_delete_check % {
-                    "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(name),
-                })
-        # Drop unique constraints, SQL Server requires explicit deletion
-        for name, infodict in constraints.items():
-            if field.column in infodict['columns'] and infodict['unique'] and not infodict['primary_key']:
-                self.execute(self.sql_delete_unique % {
-                    "table": self.quote_name(model._meta.db_table),
-                    "name": self.quote_name(name),
-                })
-        # Delete the column
-        sql = self.sql_delete_column % {
-            "table": self.quote_name(model._meta.db_table),
-            "column": self.quote_name(field.column),
-        }
-        self.execute(sql)
-        # Reset connection if required
-        if self.connection.features.connection_persists_old_columns:
-            self.connection.close()
-        # Remove all deferred statements referencing the deleted column.
-        for sql in list(self.deferred_sql):
-            if isinstance(sql, Statement) and sql.references_column(model._meta.db_table, field.column):
-                self.deferred_sql.remove(sql)
