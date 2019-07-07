@@ -467,7 +467,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         username = self.connection.get('USER', '')
         password = self.connection.get('PASSWORD', '')
         database = self.connection.get('NAME')
-        account_authentication = "OPERATING_SYSTEM_AUTH" if username and password else "DATABASE_AUTH"
+        account_authentication = "OPERATING_SYSTEM_AUTH" if not username else "DATABASE_AUTH"
         arcpy.CreateDatabaseConnection(out_folder_path, out_name, "SQL_SERVER", instance, account_authentication,
                                        username, password, "SAVE_USERNAME", database)
 
