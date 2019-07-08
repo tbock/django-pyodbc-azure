@@ -486,60 +486,77 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     #         new_type += " NOT NULL"
     #     return new_type
 
-    def _create_connection(self, model, out_folder_path, out_name):
+    def _create_connection(self):
         """
         Create a sde connection to use if it doesn't already exist
         """
-        sde_file = "{}\\{}".format(out_folder_path, out_name)
+        connection_params = self.connection.get_connection_params()
+        out_folder_path = os.getcwd()
+        instance = connection_params.get('HOST')
+        username = connection_params.get('USER', '')
+        password = connection_params.get('PASSWORD', '')
+        database = connection_params.get('NAME')
+        sde_file = "{}\\{}.sde".format(out_folder_path, database)
         if os.path.isfile(sde_file):
             return sde_file
 
-        instance = self.connection.get('HOST')
-        username = self.connection.get('USER', '')
-        password = self.connection.get('PASSWORD', '')
-        database = self.connection.get('NAME')
-        account_authentication = "OPERATING_SYSTEM_AUTH" if username and password else "DATABASE_AUTH"
-        arcpy.CreateDatabaseConnection_management(out_folder_path, out_name, "SQL_SERVER", instance,
+        account_authentication = "DATABASE_AUTH" if username and password else "OPERATING_SYSTEM_AUTH"
+        arcpy.CreateDatabaseConnection_management(out_folder_path, database, "SQL_SERVER", instance,
                                                   account_authentication,
                                                   username, password, "SAVE_USERNAME", database)
+        return sde_file
 
     arcgis_data_types = {
-        # 'AutoField':         'int IDENTITY (1, 1)',
-        # 'BigAutoField':      'bigint IDENTITY (1, 1)',
-        'bigint': 'LONG',
-        'varbinary(max)': 'BLOB',
-        'bit': 'SHORT',
-        'nvarchar': 'TEXT',
-        'date': 'DATE',
-        'datetime2': 'DATE',
-        'numeric': 'DOUBLE',
-        'double precision': 'DOUBLE',
-        'int': 'SHORT',
-        'smallint': 'SHORT',
-        'time': 'DATE',
-        'char(32)': 'GUID',  # This may not be a good idea
+        # 'AutoField': 'int IDENTITY (1, 1)',
+        # 'BigAutoField': 'bigint IDENTITY (1, 1)',
+        'BigIntegerField': 'LONG',
+        'BinaryField': 'BLOB',
+        'BooleanField': 'SHORT',
+        'CharField': 'TEXT',
+        'DateField': 'DATE',
+        'DateTimeField': 'DATE',
+        'DecimalField': 'DOUBLE',
+        'DurationField': 'LONG',
+        'FileField': 'TEXT',
+        'FilePathField': 'TEXT',
+        'FloatField': 'FLOAT',
+        'IntegerField': 'SHORT',
+        'IPAddressField': 'TEXT',
+        'GenericIPAddressField': 'TEXT',
+        'NullBooleanField': 'SHORT',
+        'OneToOneField': 'SHORT', #NOPE
+        'PositiveIntegerField': 'LONG',
+        'PositiveSmallIntegerField': 'SHORT',
+        'SlugField': 'TEXT',
+        'SmallIntegerField': 'SHORT',
+        'TextField': 'TEXT',
+        'TimeField': 'DATE',
+        'UUIDField': 'GUID',
     }
 
-    def _convert_field_type_to_arcgis(self, definition_string, field):
-        extra_params = {'field_is_required': field.required}
-        for sql_type, arcgis_type in self.arcgis_data_types.items():
-            if sql_type in definition_string:
-                if arcgis_type == 'TEXT':
-                    extra_params['field_length'] = field.max_length if field.max_length else 8000
-                elif arcgis_type == 'DOUBLE':
-                    extra_params['field_scale'] = field.max_digits
-                    extra_params['field_prevision'] = field.decimal_places
+    def _convert_field_type_to_arcgis(self, field):
+        extra_params = {
+            'field_is_required': getattr(field, 'required', False),
+            'field_is_nullable': getattr(field, 'null', False)
+        }
+        django_type = type(field).__name__
+        if django_type == 'ForeignKey':
+            django_type = type(field.target_field).__name__
+        arcgis_type = self.arcgis_data_types.get(django_type)
+        if arcgis_type == 'TEXT':
+            extra_params['field_length'] = field.max_length if field.max_length else 8000
+        elif arcgis_type == 'DOUBLE':
+            extra_params['field_scale'] = field.max_digits
+            extra_params['field_precision'] = field.decimal_places
 
-                if 'NOT NULL' in definition_string:
-                    extra_params['field_is_nullable'] = False
-
-                return arcgis_type
+        return arcgis_type, extra_params
 
     def add_field(self, model, field):
         """
         Create a field on a model. Usually involves adding a column, but may
         involve adding a table instead (for M2M fields).
         """
+        sde_file = self._create_connection()
         # Special-case implicit M2M tables
         if field.many_to_many and field.remote_field.through._meta.auto_created:
             return self.create_model(field.remote_field.through)
@@ -550,7 +567,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             return
         # Check constraints can go on the column SQL here
         db_params = field.db_parameters(connection=self.connection)
-        arcgis_field_type, extra_params = self._convert_field_type_to_arcgis(definition, field)
+        arcgis_field_type, extra_params = self._convert_field_type_to_arcgis(field)
 
         # if db_params['check']:
         #     definition += " CHECK (%s)" % db_params['check']
@@ -562,13 +579,21 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # }
         # self.execute(sql, params)
         # just use arcpy instead
-        arcpy.AddField_management(self.quote_name(model._meta.db_table), self.quote_name(field.column),
-                                  arcgis_field_type,
+        arcpy.AddField_management("{}\\{}".format(sde_file, self.arcgisify_db_table(model._meta.db_table)), field.column, arcgis_field_type,
                                   field_alias=field.verbose_name, **extra_params)
         # if db_params['check']:
         #     arcpy.AddIndex(self.quote_name(model._meta.db_table), self.quote_name(field.column), {index_name}, {unique}, {ascending})
         # Drop the default if we need to
         # (Django usually does not use in-database defaults)
+
+        if type(field).__name__ == "ForeignKey":
+            arcpy.CreateRelationshipClass_management("{}\\{}".format(sde_file, self.arcgisify_db_table(field.related_model()._meta.db_table)),
+                                                     "{}\\{}".format(sde_file, self.arcgisify_db_table(model._meta.db_table)),
+                                                     "{}\\{}_{}_REL".format(sde_file, self.arcgisify_db_table(field.related_model()._meta.db_table),
+                                                                            self.arcgisify_db_table(model._meta.db_table)),
+                                                     "SIMPLE", "{}".format(field.related_model()._meta.verbose_name),
+                                                     "{}".format(model._meta.verbose_name), "NONE", "ONE_TO_MANY", "NONE",
+                                                     "{}".format(field.target_field.column), "{}".format(field.column))
 
     def create_model(self, model):
         """
@@ -578,13 +603,13 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # Create column SQL, add FK deferreds if needed
         # column_sqls = []
         # params = []
-        folder = os.getcwd()
-        sde_file = self._create_connection(model, folder, self.connection.get('NAME'))
+        sde_file = self._create_connection()
 
         # Add any unique_togethers (always deferred, as some fields might be
         # created afterwards, like geometry fields with some backends)
 
-        arcpy.CreateTable_management(sde_file, self.quote_name(model._meta.db_table))
+        if not arcpy.Exists("{}\\{}".format(sde_file, self.arcgisify_db_table(model._meta.db_table))):
+            arcpy.CreateTable_management(sde_file, self.arcgisify_db_table(model._meta.db_table))
 
         for field in model._meta.local_fields:
             # SQL
@@ -636,3 +661,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         """
         arcpy.DeleteField_management(self.quote_name(model._meta.db_table), self.quote_name(field.column))
         # Special-case implicit M2M tables
+
+    def alter_db_table(self, model, old_db_table, new_db_table):
+        sde_file = self._create_connection()
+        arcpy.Rename_management("{}\\{}".format(sde_file, old_db_table), "{}\\{}".format(
+            sde_file, new_db_table))
+
+    def arcgisify_db_table(self, table_name):
+        return table_name.rstrip('_EVW')
